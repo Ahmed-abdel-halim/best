@@ -73,6 +73,7 @@ const CONFIG = {
   // Upstream Coursatk — stays SERVER-SIDE only
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN:
+    process.env.COURSATK_TOKEN ||
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMDk1NTUsInJvbGUiOiJzdHVkZW50IiwidXVpZCI6IjU3OGIxNjBjMjgxZWVkY2Y1ZTY4MjViNDZmMWExNTY0In0.x9vV-N_13KcrGbx-y9owTgGdirKpKh_X0JXDpolYegs",
   DEFAULT_YEAR_ID: 4,
   STREAM_HOSTS: [
@@ -219,9 +220,9 @@ async function getCoursatkToken() {
       return remote.token;
     }
   } catch {}
-  cachedCoursatkToken = CONFIG.COURSATK_TOKEN;
+  cachedCoursatkToken = process.env.COURSATK_TOKEN || CONFIG.COURSATK_TOKEN;
   cachedTokenAt = Date.now();
-  return CONFIG.COURSATK_TOKEN;
+  return cachedCoursatkToken;
 }
 
 
