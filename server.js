@@ -545,6 +545,47 @@ app.get("/api/public/code-types", (_req, res) => {
   res.json({ success: true, data: types });
 });
 
+app.get("/api/public/debug-segment", async (_req, res) => {
+  try {
+    const playRes = await upstreamJson(`/video/21597/stream-weave/play`, { method: "POST" });
+    const playTok = playRes.data.token;
+    const vid = playRes.data.video_id;
+
+    const variantRes = await fetch(`https://api.stream-weave.com/api/v1/videos/${vid}/stream/480/playlist.m3u8`, {
+      headers: {
+        Authorization: `Bearer ${playTok}`,
+        Origin: "https://coursatk.online",
+        Referer: "https://coursatk.online/",
+        "X-Requested-With": "com.mycompany.app.soulbrowser",
+        "User-Agent": CONFIG.STREAM_UA
+      }
+    });
+    const playlistText = await variantRes.text();
+    const segLine = playlistText.split("\n").find(l => l.includes(".woff2") || l.includes(".ts"));
+
+    const cdnRes = await fetch(segLine.trim(), {
+      headers: {
+        Authorization: `Bearer ${playTok}`,
+        Origin: "https://coursatk.online",
+        Referer: "https://coursatk.online/",
+        "X-Requested-With": "com.mycompany.app.soulbrowser",
+        "User-Agent": CONFIG.STREAM_UA
+      }
+    });
+    const body = await cdnRes.text();
+    res.json({
+      playSuccess: playRes.success,
+      variantStatus: variantRes.status,
+      segUrl: segLine.trim(),
+      cdnStatus: cdnRes.status,
+      cdnHeaders: Object.fromEntries(cdnRes.headers.entries()),
+      cdnBody: body.slice(0, 500)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 // STUDENT AUTH
 // ═══════════════════════════════════════════════════════════
@@ -996,7 +1037,9 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
       Range: req.headers.range || undefined
     }, req.headers);
     if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`Segment HTTP ${upstream.status}`);
+      const errText = await upstream.text().catch(() => "");
+      console.error(`[upstream segment error] status: ${upstream.status}, url: ${url}, body: ${errText.slice(0, 300)}`);
+      throw new Error(`Segment HTTP ${upstream.status} - ${errText.slice(0, 100)}`);
     }
     const encrypted = Buffer.from(await upstream.arrayBuffer());
     if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
