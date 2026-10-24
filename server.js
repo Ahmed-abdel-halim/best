@@ -15,7 +15,6 @@ import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 // Load .env file if present (VPS / local)
 try {
   const envPath = path.join(__dirname, ".env");
@@ -30,14 +29,15 @@ try {
         const eq = trimmed.indexOf("=");
         if (eq > 0) {
           const k = trimmed.slice(0, eq).trim();
-          let v = trimmed.slice(eq + 1).trim();
-          if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+          const v = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
           if (!process.env[k]) process.env[k] = v;
         }
       }
     }
   }
-} catch {}
+} catch (e) {
+  console.warn("Could not load .env:", e.message);
+}
 
 const app = express();
 app.set("trust proxy", 1);
@@ -103,18 +103,21 @@ const CONFIG = {
   STREAM_HOSTS: [
     "api.coursatk.online",
     "stream-weave.com",
+    "api.stream-weave.com",
     "floravon.online",
+    "floravon.shop",   // new CDN domain used for segments
     "c-cdn.online"
   ],
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
   STREAM_X_REQUESTED_WITH: "com.mycompany.app.soulbrowser",
   STREAM_UA:
-    "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/155.0.8059.43 Mobile Safari/537.36",
+  STREAM_SEC_CH_UA: '"Android WebView";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
+  STREAM_SEC_CH_UA_PLATFORM: '"Android"',
+  STREAM_ACCEPT_LANGUAGE: "ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6",
+  STREAM_WEAVE_API: "https://api.stream-weave.com",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
-  WORKER_PROXY:
-    process.env.WORKER_PROXY ||
-    "https://gentle-unit-a724.ahmedholim42.workers.dev/?url=",
   // Firebase RTDB (open rules as provided)
   FIREBASE: "https://english-73376-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
@@ -247,9 +250,9 @@ async function getCoursatkToken() {
       return remote.token;
     }
   } catch {}
-  cachedCoursatkToken = process.env.COURSATK_TOKEN || CONFIG.COURSATK_TOKEN;
+  cachedCoursatkToken = CONFIG.COURSATK_TOKEN;
   cachedTokenAt = Date.now();
-  return cachedCoursatkToken;
+  return CONFIG.COURSATK_TOKEN;
 }
 
 
@@ -273,6 +276,31 @@ function getBearer(req) {
   return "";
 }
 
+// ── Student record cache (30s) + retry — avoids Firebase 500s under segment bursts ──
+const studentCache = new Map();
+async function getStudentCached(code) {
+  const c = studentCache.get(code);
+  if (c && Date.now() - c.at < 30_000) return c.student;
+  let student;
+  try {
+    student = await fbGet(`students/${code}`);
+  } catch {
+    await new Promise((r) => setTimeout(r, 300));
+    try {
+      student = await fbGet(`students/${code}`);
+    } catch (e) {
+      if (c) return c.student; // serve stale rather than fail playback
+      throw e;
+    }
+  }
+  studentCache.set(code, { student, at: Date.now() });
+  return student;
+}
+setInterval(() => {
+  const t = Date.now();
+  for (const [k, c] of studentCache) if (t - c.at > 120_000) studentCache.delete(k);
+}, 60_000).unref();
+
 // ── Student auth middleware ──
 async function requireStudent(req, res, next) {
   try {
@@ -294,7 +322,7 @@ async function requireStudent(req, res, next) {
     }
 
     // Validate student still exists & active & not expired
-    const student = await fbGet(`students/${sess.code}`);
+    const student = await getStudentCached(sess.code);
     if (!student || student.active === false) {
       studentSessions.delete(token);
       return jsonError(res, 401, "الحساب غير موجود أو موقوف");
@@ -307,6 +335,7 @@ async function requireStudent(req, res, next) {
     const devices = student.devices || {};
     if (sess.deviceId && !devices[sess.deviceId]) {
       studentSessions.delete(token);
+      studentCache.delete(sess.code);
       try { await fbDelete(`sessions/${token}`); } catch {}
       return jsonError(res, 401, "تم تسجيل خروج هذا الجهاز من لوحة التحكم");
     }
@@ -504,35 +533,114 @@ function allowedStreamUrl(raw, session = null) {
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
   const ch = clientHeaders || {};
-  const headers = {
-    Authorization: `Bearer ${session.token}`,
-    Accept: "*/*",
-    "Cache-Control": "no-cache",
-    Origin: CONFIG.STREAM_ORIGIN,
-    Referer: CONFIG.STREAM_REFERER,
-    "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
-    "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
-  };
-  for (const name of [
-    "sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile",
-    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "accept-language"
-  ]) {
-    if (ch[name]) headers[name] = ch[name];
+  const isMediaSegmentHost = /floravon\.(online|shop)|c-cdn\.online|suo\d*\.floravon/i.test(url);
+
+  let headers;
+  if (isMediaSegmentHost) {
+    headers = {
+      Accept: "*/*",
+      "User-Agent": CONFIG.STREAM_UA,
+      "sec-ch-ua-platform": CONFIG.STREAM_SEC_CH_UA_PLATFORM,
+      "sec-ch-ua": CONFIG.STREAM_SEC_CH_UA,
+      "sec-ch-ua-mobile": "?1",
+      Origin: CONFIG.STREAM_ORIGIN,
+      "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
+      "sec-fetch-site": "cross-site",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-dest": "empty",
+      Referer: CONFIG.STREAM_REFERER,
+      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE,
+      Priority: "u=1, i"
+    };
+  } else {
+    headers = {
+      Accept: "*/*",
+      "Cache-Control": "no-cache",
+      Origin: CONFIG.STREAM_ORIGIN,
+      Referer: CONFIG.STREAM_REFERER,
+      "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
+      "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA,
+      "sec-ch-ua-platform": CONFIG.STREAM_SEC_CH_UA_PLATFORM,
+      "sec-ch-ua": CONFIG.STREAM_SEC_CH_UA,
+      "sec-ch-ua-mobile": "?1",
+      "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE
+    };
+    if (session?.token) headers.Authorization = `Bearer ${session.token}`;
   }
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  let targetUrl = url;
-  if (CONFIG.WORKER_PROXY && !url.includes("api.stream-weave.com")) {
-    targetUrl = CONFIG.WORKER_PROXY + encodeURIComponent(url);
+  return fetch(url, { headers, cache: "no-store", redirect: "follow" });
+}
+
+/** Proxy Stream-Weave path. Stream JWT stays SERVER-SIDE only (session.token). */
+async function proxyStreamPath(relPath, session, req, res) {
+  const clean = String(relPath || "").replace(/^\/+/, "").replace(/\.\./g, "");
+  if (!clean || clean.length > 500) return jsonError(res, 400, "path غير صالح");
+  if (!session?.token) return jsonError(res, 401, "جلسة التشغيل غير صالحة");
+
+  let upstreamUrl = /^https?:\/\//i.test(clean)
+    ? clean
+    : `${CONFIG.STREAM_WEAVE_API}/${clean}`;
+
+  const fakeSession = {
+    token: session.token,
+    allowedHosts: new Set([
+      "api.stream-weave.com", "stream-weave.com",
+      "floravon.online", "floravon.shop", "c-cdn.online",
+      ...CONFIG.STREAM_HOSTS
+    ])
+  };
+  try { fakeSession.allowedHosts.add(new URL(upstreamUrl).hostname); } catch {}
+
+  let upstream = await streamFetch(fakeSession, upstreamUrl, {
+    Range: req.headers.range || undefined
+  }, req.headers);
+
+  if ([301, 302, 307, 308].includes(upstream.status)) {
+    const loc = upstream.headers.get("location");
+    if (loc) {
+      try { fakeSession.allowedHosts.add(new URL(loc).hostname); } catch {}
+      upstream = await streamFetch(fakeSession, loc, {
+        Range: req.headers.range || undefined
+      }, req.headers);
+    }
   }
-  return fetch(targetUrl, { headers, cache: "no-store" });
+
+  if (!upstream.ok && upstream.status !== 206) {
+    const body = (await upstream.text().catch(() => "")).slice(0, 200);
+    console.error("[stream-path-fail]", upstream.status, clean, body);
+    return jsonError(
+      res,
+      upstream.status === 401 || upstream.status === 403 ? upstream.status : 502,
+      `Upstream ${upstream.status}`
+    );
+  }
+
+  const ct = upstream.headers.get("content-type") || "application/octet-stream";
+  const buf = Buffer.from(await upstream.arrayBuffer());
+  if (buf.length > CONFIG.MAX_PROXY_BYTES) return jsonError(res, 413, "الملف كبير");
+
+  res.status(upstream.status === 206 ? 206 : 200);
+  res.set({
+    "Content-Type": ct,
+    "Content-Length": String(buf.length),
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*"
+  });
+  const cr = upstream.headers.get("content-range");
+  if (cr) res.set("Content-Range", cr);
+  res.send(buf);
 }
 
 // ═══════════════════════════════════════════════════════════
 // PUBLIC (no auth)
 // ═══════════════════════════════════════════════════════════
-app.use(rateLimit({ max: 50, windowMs: 60_000, scope: "global" }));
+const globalLimiter = rateLimit({ max: 50, windowMs: 60_000, scope: "global" });
+app.use((req, res, next) =>
+  req.path.startsWith("/api/stream") ? next() : globalLimiter(req, res, next)
+);
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -550,51 +658,6 @@ app.get("/api/public/code-types", (_req, res) => {
     types[k] = { label: v.label, durationMs: v.ms };
   }
   res.json({ success: true, data: types });
-});
-
-app.get("/api/public/debug-segment", async (_req, res) => {
-  try {
-    const playRes = await upstreamJson(`/video/21597/stream-weave/play`, { method: "POST" });
-    const playTok = playRes.data.token;
-    const vid = playRes.data.video_id;
-
-    const variantRes = await fetch(`https://api.stream-weave.com/api/v1/videos/${vid}/stream/480/playlist.m3u8`, {
-      headers: {
-        Authorization: `Bearer ${playTok}`,
-        Origin: "https://coursatk.online",
-        Referer: "https://coursatk.online/",
-        "X-Requested-With": "com.mycompany.app.soulbrowser",
-        "User-Agent": CONFIG.STREAM_UA
-      }
-    });
-    const playlistText = await variantRes.text();
-    const segLine = playlistText.split("\n").find(l => l.includes(".woff2") || l.includes(".ts"));
-    const rawSegUrl = segLine.trim();
-    const targetSegUrl = CONFIG.WORKER_PROXY ? (CONFIG.WORKER_PROXY + encodeURIComponent(rawSegUrl)) : rawSegUrl;
-
-    const cdnRes = await fetch(targetSegUrl, {
-      headers: {
-        Authorization: `Bearer ${playTok}`,
-        Origin: "https://coursatk.online",
-        Referer: "https://coursatk.online/",
-        "X-Requested-With": "com.mycompany.app.soulbrowser",
-        "User-Agent": CONFIG.STREAM_UA
-      }
-    });
-    const body = await cdnRes.text();
-    res.json({
-      playSuccess: playRes.success,
-      variantStatus: variantRes.status,
-      segUrl: rawSegUrl,
-      targetSegUrl,
-      cdnStatus: cdnRes.status,
-      cdnLength: cdnRes.headers.get("content-length"),
-      cdnHeaders: Object.fromEntries(cdnRes.headers.entries()),
-      cdnBody: body.slice(0, 300)
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
-  }
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -900,7 +963,9 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       videoId: String(data.data.video_id),
       token: data.data.token,
       streamUrl: data.data.stream_url,
+      playId: String(req.params.videoId),
       createdAt: now(),
+      lastUsed: now(),
       plainKey: null,
       defaultIv: null,
       allowedHosts: new Set([new URL(data.data.stream_url).hostname]),
@@ -922,12 +987,95 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
 function getStreamSession(id) {
   const s = streamSessions.get(id);
   if (!s) return null;
-  if (now() - s.createdAt > CONFIG.STREAM_SESSION_MS) {
+  const last = s.lastUsed || s.createdAt;
+  if (now() - last > CONFIG.STREAM_SESSION_MS) {
     streamSessions.delete(id);
     return null;
   }
+  s.lastUsed = now();
   return s;
 }
+
+// Re-issue playback token when upstream returns 401 on the master playlist
+async function refreshPlayback(session) {
+  const data = await upstreamJson(
+    `/video/${encodeURIComponent(session.playId)}/stream-weave/play`,
+    { method: "POST", headers: { Accept: "application/json" } }
+  );
+  if (!data?.success || !data?.data?.token || !data?.data?.stream_url) {
+    throw new Error("فشل تجديد التوكن");
+  }
+  session.token = data.data.token;
+  session.streamUrl = data.data.stream_url;
+  try { session.allowedHosts.add(new URL(session.streamUrl).hostname); } catch {}
+  session.lastUsed = now();
+  console.log(`[refresh] playback token renewed for ${session.videoId}`);
+}
+
+/**
+ * POST /api/video/:videoId/play
+ * Upstream Stream-Weave token is stored SERVER-SIDE only.
+ * Client receives opaque session id — never the Coursatk/SW JWT.
+ */
+app.post("/api/video/:videoId/play", requireStudent, async (req, res) => {
+  try {
+    const data = await upstreamJson(
+      `/video/${encodeURIComponent(req.params.videoId)}/stream-weave/play`,
+      { method: "POST", headers: { Accept: "application/json" } }
+    );
+    if (!data?.success || !data?.data?.token || !data?.data?.video_id) {
+      throw new Error("Playback response ناقص");
+    }
+    const id = crypto.randomUUID();
+    streamSessions.set(id, {
+      id,
+      videoId: String(data.data.video_id),
+      token: data.data.token,          // NEVER sent to client
+      streamUrl: data.data.stream_url || null,
+      playId: String(req.params.videoId),
+      createdAt: now(),
+      lastUsed: now(),
+      plainKey: null,
+      defaultIv: null,
+      allowedHosts: new Set(["api.stream-weave.com", "stream-weave.com"]),
+      ownerCode: req.session.code
+    });
+    res.json({
+      success: true,
+      data: {
+        session: id,
+        video_id: data.data.video_id
+        // no token, no stream_url — hidden on purpose
+      },
+      session: id,
+      video_id: data.data.video_id
+    });
+  } catch (e) {
+    jsonError(res, 502, e.message);
+  }
+});
+
+/**
+ * GET /api/stream?path=videos/...&s=SESSION_ID
+ * Student auth required. Stream-Weave JWT resolved from server session.
+ */
+app.get("/api/stream", requireStudent, async (req, res) => {
+  try {
+    const relPath = String(req.query.path || "").trim();
+    const sid = String(req.query.s || req.query.session || "").trim();
+    if (!sid) return jsonError(res, 400, "session مطلوب");
+    const session = getStreamSession(sid);
+    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+    if (session.ownerCode !== req.session.code) {
+      return jsonError(res, 403, "جلسة تشغيل ليست لك");
+    }
+    await proxyStreamPath(relPath, session, req, res);
+  } catch (e) {
+    console.error("[/api/stream]", e.message);
+    if (!res.headersSent) jsonError(res, 502, e.message);
+  }
+});
+
 
 app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
   const session = getStreamSession(req.params.sessionId);
@@ -937,7 +1085,11 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
   }
 
   try {
-    const master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    let master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    if (master.status === 401 && session.playId) {
+      await refreshPlayback(session);
+      master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    }
     if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
     const masterText = await master.text();
     const lines = masterText.split(/\r?\n/);
@@ -954,7 +1106,11 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
     }
 
     if (variant) {
-      const variantRes = await streamFetch(session, variant, {}, req.headers);
+      let variantRes = await streamFetch(session, variant, {}, req.headers);
+      if (variantRes.status === 401 && session.playId) {
+        await refreshPlayback(session);
+        variantRes = await streamFetch(session, variant, {}, req.headers);
+      }
       if (!variantRes.ok) throw new Error(`Variant HTTP ${variantRes.status}`);
       return rewritePlaylist(
         req.params.sessionId, session, await variantRes.text(), variant, res, req.headers
@@ -989,7 +1145,10 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       const uri = line.match(/URI="([^"]+)"/)?.[1];
       const ivHex = line.match(/IV=(0x[0-9a-fA-F]+|[0-9a-fA-F]{32})/i)?.[1];
       if (ivHex) currentIv = parseIvHex(ivHex);
-      if (uri && !keyFetched) {
+      if (uri && !keyFetched && session.plainKey) {
+        session.defaultIv = currentIv;
+        keyFetched = true;
+      } else if (uri && !keyFetched) {
         const keyUrl = new URL(uri, baseUrl).href;
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
         const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
@@ -1048,9 +1207,16 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
       Range: req.headers.range || undefined
     }, req.headers);
     if (!upstream.ok && upstream.status !== 206) {
-      const errText = await upstream.text().catch(() => "");
-      console.error(`[upstream segment error] status: ${upstream.status}, url: ${url}, body: ${errText.slice(0, 300)}`);
-      throw new Error(`Segment HTTP ${upstream.status} - ${errText.slice(0, 100)}`);
+      const body = (await upstream.text().catch(() => "")).slice(0, 300);
+      console.error("[segment-fail]", {
+        status: upstream.status,
+        host: new URL(url).hostname,
+        server: upstream.headers.get("server"),
+        cfRay: upstream.headers.get("cf-ray"),
+        ageSec: Math.round((now() - session.createdAt) / 1000),
+        body
+      });
+      throw new Error(`Segment HTTP ${upstream.status}`);
     }
     const encrypted = Buffer.from(await upstream.arrayBuffer());
     if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
@@ -1059,8 +1225,13 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
     let plain;
     try {
       plain = decryptSegment(encrypted, session.plainKey, iv);
-    } catch {
-      plain = encrypted;
+    } catch (decErr) {
+      console.warn("[segment-decrypt-fail]", {
+        host: new URL(url).hostname,
+        len: encrypted.length,
+        err: decErr.message
+      });
+      plain = encrypted; // fallback: send as-is (may still fail to play)
     }
     res.status(200);
     res.set({
@@ -1557,7 +1728,7 @@ setInterval(() => {
     if (s.expiresAt && t > s.expiresAt) adminSessions.delete(k);
   }
   for (const [k, s] of streamSessions) {
-    if (t - s.createdAt > CONFIG.STREAM_SESSION_MS) streamSessions.delete(k);
+    if (t - (s.lastUsed || s.createdAt) > CONFIG.STREAM_SESSION_MS) streamSessions.delete(k);
   }
 }, 60_000).unref();
 
