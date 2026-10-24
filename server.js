@@ -112,6 +112,9 @@ const CONFIG = {
   STREAM_UA:
     "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
+  WORKER_PROXY:
+    process.env.WORKER_PROXY ||
+    "https://gentle-unit-a724.ahmedholim42.workers.dev/?url=",
   // Firebase RTDB (open rules as provided)
   FIREBASE: "https://english-73376-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
@@ -519,7 +522,11 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  return fetch(url, { headers, cache: "no-store" });
+  let targetUrl = url;
+  if (CONFIG.WORKER_PROXY && !url.includes("api.stream-weave.com")) {
+    targetUrl = CONFIG.WORKER_PROXY + encodeURIComponent(url);
+  }
+  return fetch(targetUrl, { headers, cache: "no-store" });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -562,8 +569,10 @@ app.get("/api/public/debug-segment", async (_req, res) => {
     });
     const playlistText = await variantRes.text();
     const segLine = playlistText.split("\n").find(l => l.includes(".woff2") || l.includes(".ts"));
+    const rawSegUrl = segLine.trim();
+    const targetSegUrl = CONFIG.WORKER_PROXY ? (CONFIG.WORKER_PROXY + encodeURIComponent(rawSegUrl)) : rawSegUrl;
 
-    const cdnRes = await fetch(segLine.trim(), {
+    const cdnRes = await fetch(targetSegUrl, {
       headers: {
         Authorization: `Bearer ${playTok}`,
         Origin: "https://coursatk.online",
@@ -576,10 +585,12 @@ app.get("/api/public/debug-segment", async (_req, res) => {
     res.json({
       playSuccess: playRes.success,
       variantStatus: variantRes.status,
-      segUrl: segLine.trim(),
+      segUrl: rawSegUrl,
+      targetSegUrl,
       cdnStatus: cdnRes.status,
+      cdnLength: cdnRes.headers.get("content-length"),
       cdnHeaders: Object.fromEntries(cdnRes.headers.entries()),
-      cdnBody: body.slice(0, 500)
+      cdnBody: body.slice(0, 300)
     });
   } catch (err) {
     res.status(500).json({ error: err.message, stack: err.stack });
