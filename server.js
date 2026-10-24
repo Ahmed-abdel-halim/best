@@ -106,7 +106,9 @@ const CONFIG = {
     "api.stream-weave.com",
     "floravon.online",
     "floravon.shop",   // new CDN domain used for segments
-    "c-cdn.online"
+    "c-cdn.online",
+    "cloudfrount.shop",
+    "cloud3.cloudfrount.shop"
   ],
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
@@ -533,7 +535,7 @@ function allowedStreamUrl(raw, session = null) {
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
   const ch = clientHeaders || {};
-  const isMediaSegmentHost = /floravon\.(online|shop)|c-cdn\.online|suo\d*\.floravon/i.test(url);
+  const isMediaSegmentHost = /floravon\.(online|shop)|c-cdn\.online|suo\d*\.floravon|cloudfrount\.(online|shop)|seg-[^.]+\.(woff2|ts)/i.test(url);
 
   let headers;
   if (isMediaSegmentHost) {
@@ -580,15 +582,21 @@ async function proxyStreamPath(relPath, session, req, res) {
   if (!clean || clean.length > 500) return jsonError(res, 400, "path غير صالح");
   if (!session?.token) return jsonError(res, 401, "جلسة التشغيل غير صالحة");
 
-  let upstreamUrl = /^https?:\/\//i.test(clean)
-    ? clean
-    : `${CONFIG.STREAM_WEAVE_API}/${clean}`;
+  let upstreamUrl;
+  if (/^https?:\/\//i.test(clean)) {
+    upstreamUrl = clean;
+  } else {
+    const base = CONFIG.STREAM_WEAVE_API.replace(/\/+$/, "");
+    const norm = clean.replace(/^\/+/, "");
+    const pth = norm.startsWith("api/") ? norm : `api/v1/${norm}`;
+    upstreamUrl = `${base}/${pth}`;
+  }
 
   const fakeSession = {
     token: session.token,
     allowedHosts: new Set([
       "api.stream-weave.com", "stream-weave.com",
-      "floravon.online", "floravon.shop", "c-cdn.online",
+      "floravon.online", "floravon.shop", "c-cdn.online", "cloudfrount.shop",
       ...CONFIG.STREAM_HOSTS
     ])
   };
