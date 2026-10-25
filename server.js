@@ -660,6 +660,39 @@ app.get("/health", (_req, res) => {
   });
 });
 
+app.get("/api/public/debug-upstream", async (req, res) => {
+  try {
+    const targetUrl = String(req.query.url || "");
+    if (!targetUrl) return res.json({ error: "url param required" });
+    const isMedia = /floravon|c-cdn|cloudfrount/i.test(targetUrl);
+    const headers = isMedia ? {
+      Accept: "*/*",
+      "User-Agent": CONFIG.STREAM_UA,
+      "sec-ch-ua-platform": CONFIG.STREAM_SEC_CH_UA_PLATFORM,
+      "sec-ch-ua": CONFIG.STREAM_SEC_CH_UA,
+      "sec-ch-ua-mobile": "?1",
+      Origin: CONFIG.STREAM_ORIGIN,
+      "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
+      "sec-fetch-site": "cross-site",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-dest": "empty",
+      Referer: CONFIG.STREAM_REFERER,
+      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE,
+      Priority: "u=1, i"
+    } : {};
+    const r = await fetch(targetUrl, { headers });
+    const body = await r.text();
+    res.json({
+      status: r.status,
+      headers: Object.fromEntries(r.headers.entries()),
+      body: body.slice(0, 1000)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, stack: e.stack });
+  }
+});
+
 app.get("/api/public/code-types", (_req, res) => {
   const types = {};
   for (const [k, v] of Object.entries(CONFIG.CODE_TYPES)) {
