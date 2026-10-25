@@ -537,6 +537,16 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   const ch = clientHeaders || {};
   const isMediaSegmentHost = /floravon\.(online|shop)|c-cdn\.online|suo\d*\.floravon|cloudfrount\.(online|shop)|seg-[^.]+\.(woff2|ts)/i.test(url);
 
+  if (isMediaSegmentHost) {
+    try {
+      const workerUrl = `https://gentle-unit-a724.ahmedholim42.workers.dev/?url=${encodeURIComponent(url)}`;
+      const wRes = await fetch(workerUrl, { headers: { Accept: "*/*" }, cache: "no-store" });
+      if (wRes.ok || wRes.status === 206) return wRes;
+    } catch (e) {
+      console.warn("[worker-proxy-fallback]", e.message);
+    }
+  }
+
   let headers;
   if (isMediaSegmentHost) {
     headers = {
