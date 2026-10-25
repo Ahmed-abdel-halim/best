@@ -93,12 +93,12 @@ setInterval(() => {
 // CONFIG (in-code — no Railway vars required for core secrets)
 // ═══════════════════════════════════════════════════════════
 const CONFIG = {
-  PORT: Number(process.env.PORT || 3000),
+  PORT: Number(process.env.PORT || 4000),
   // Upstream Coursatk — stays SERVER-SIDE only
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN:
     process.env.COURSATK_TOKEN ||
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMDk1NTUsInJvbGUiOiJzdHVkZW50IiwidXVpZCI6IjU3OGIxNjBjMjgxZWVkY2Y1ZTY4MjViNDZmMWExNTY0In0.x9vV-N_13KcrGbx-y9owTgGdirKpKh_X0JXDpolYegs",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMTYyOTYsInJvbGUiOiJzdHVkZW50IiwidXVpZCI6ImM0YzVlMzU3YTkyMjFkNTJkNjk5NWFiNGRkODhjYjk2In0.FC2ySannXQAHsooVeSGAgxVfGX9dLhF2CS4TzZTfdMc",
   DEFAULT_YEAR_ID: 4,
   STREAM_HOSTS: [
     "api.coursatk.online",
