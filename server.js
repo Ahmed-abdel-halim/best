@@ -735,12 +735,32 @@ app.post("/api/auth/login", rateLimit({ max: 15, windowMs: 60_000, scope: "login
     if (!student || student.active === false) {
       return jsonError(res, 401, "كود غير صحيح أو موقوف");
     }
-    if (student.expiresAt && now() > student.expiresAt) {
-      return jsonError(res, 403, "انتهت صلاحية الاشتراك");
-    }
 
     const devices = student.devices || {};
     const maxDevices = Number(student.maxDevices || 1);
+    const hasDevices = Object.keys(devices).length > 0;
+    const isTrial = student.type === "trial";
+    const isFirstLogin = !student.firstLoginAt && !hasDevices;
+
+    // كود الساعة (تجربة) أو كود جديد: يبدأ احتساب الوقت عند أول تسجيل دخول للطالب وليس عند استخراج الكود
+    if ((isTrial && isFirstLogin) || !student.expiresAt) {
+      const duration = CONFIG.CODE_TYPES[student.type]?.ms || (1 * 3600 * 1000);
+      student.firstLoginAt = now();
+      student.expiresAt = now() + duration;
+      studentCache.delete(code);
+      await fbPatch(`students/${code}`, {
+        firstLoginAt: student.firstLoginAt,
+        expiresAt: student.expiresAt
+      });
+    } else {
+      if (student.expiresAt && now() > student.expiresAt) {
+        return jsonError(res, 403, "انتهت صلاحية الاشتراك");
+      }
+      if (!student.firstLoginAt) {
+        student.firstLoginAt = now();
+        fbSet(`students/${code}/firstLoginAt`, student.firstLoginAt).catch(() => {});
+      }
+    }
 
     if (!devices[deviceId]) {
       const activeCount = Object.keys(devices).length;
@@ -1430,7 +1450,8 @@ app.get("/api/admin/students", requireAdmin("students_view"), async (_req, res) 
       name: s.name,
       section: s.section || null,
       type: s.type || null,
-      expiresAt: s.expiresAt,
+      expiresAt: s.expiresAt || null,
+      firstLoginAt: s.firstLoginAt || null,
       maxDevices: s.maxDevices || 1,
       devices: Object.keys(s.devices || {}).length,
       active: s.active !== false,
@@ -1493,6 +1514,7 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
     }
 
     const duration = CONFIG.CODE_TYPES[type].ms;
+    const isTrial = type === "trial";
     const record = {
       name,
       section: section || null,
@@ -1501,7 +1523,8 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
       devices: {},
       active: true,
       createdAt: now(),
-      expiresAt: now() + duration,
+      firstLoginAt: null,
+      expiresAt: isTrial ? null : (now() + duration),
       createdBy: req.admin.username
     };
     await fbSet(`students/${code}`, record);
@@ -1528,7 +1551,12 @@ app.patch("/api/admin/students/:code", requireAdmin("students_edit"), async (req
       patch.type = req.body.type;
       // optional renew from now
       if (req.body.renew) {
-        patch.expiresAt = now() + CONFIG.CODE_TYPES[req.body.type].ms;
+        if (req.body.type === "trial") {
+          patch.firstLoginAt = null;
+          patch.expiresAt = null;
+        } else {
+          patch.expiresAt = now() + CONFIG.CODE_TYPES[req.body.type].ms;
+        }
       }
     }
     if (req.body.extendMs) {
