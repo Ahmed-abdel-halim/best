@@ -407,73 +407,127 @@ function requireAdmin(permission) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Stream-Weave decrypt (server-only)
 // ═══════════════════════════════════════════════════════════
-let decryptPlaybackKeyFn = null;
+// Stream-Weave Native Decrypt (server-only, zero external dependencies)
+// ═══════════════════════════════════════════════════════════
+const SW_CONSTS = {
+  Gd: [
+    11, 48,  0, 37, 74, 26, 63, 15, 52,  4, 41, 78,
+    30, 67, 19, 56,  8, 45, 82, 34, 71, 23, 60, 12,
+    49,  1, 38, 75, 27, 64, 16, 53,  5, 42, 79, 31,
+    68, 20, 57,  9, 46, 83, 35, 72, 24, 61, 13, 50,
+     2, 39, 76, 28, 65, 17, 54,  6, 43, 80, 32, 69,
+    21, 58, 10, 47, 84, 36, 73, 25, 62, 14, 51,  3,
+    40, 77, 29, 66, 18, 55,  7, 44, 81, 33, 70, 22,
+    59
+  ],
+  Od: Buffer.from("vh.key.v2", "utf8"),
+  Rd: Buffer.from("pX7mQ2nR9wLk", "utf8"),
+  xd: Buffer.from("sA3dF8hJ", "utf8"),
+  Pd: Buffer.from("vh-aes", "utf8"),
+  qd: Buffer.from("vh-xor", "utf8"),
+  Qd: Buffer.from("vh-wire", "utf8")
+};
 
-async function loadDecryptionUtils() {
-  const cachePath = path.join(__dirname, "player.stream-weave.cache.js");
-  let source = null;
-  try {
-    if (fs.existsSync(cachePath)) source = fs.readFileSync(cachePath, "utf8");
-  } catch {}
-  if (!source) {
-    console.log("[crypto] fetching player.js…");
-    const r = await fetch(CONFIG.PLAYER_JS, {
-      headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" }
-    });
-    if (!r.ok) throw new Error(`player.js HTTP ${r.status}`);
-    source = await r.text();
-    try { fs.writeFileSync(cachePath, source); } catch {}
+function swSha256(...buffers) {
+  const hash = crypto.createHash("sha256");
+  for (const b of buffers) hash.update(b);
+  return hash.digest();
+}
+
+function decryptPlaybackKey(wrappedBuf, videoId) {
+  const r = Buffer.isBuffer(wrappedBuf) ? wrappedBuf : Buffer.from(wrappedBuf);
+  if (r.length === 16) return { key: r, code: "" };
+  if (r.length !== 86) throw new Error("Invalid wrapped key length: " + r.length);
+
+  const cleanVideoId = String(videoId || "").trim().toLowerCase();
+  if (!cleanVideoId) throw new Error("Missing videoId");
+
+  const u = r.subarray(1); // 85 bytes
+  const i = Buffer.alloc(85);
+  for (let W = 0; W < 85; W++) {
+    i[SW_CONSTS.Gd[W]] = u[W];
   }
-  const { webcrypto } = crypto;
-  const sandbox = {
-    window: {}, self: {}, globalThis: {}, global: {},
-    console: { log() {}, warn() {}, error() {}, info() {} },
-    crypto: webcrypto, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
-    atob: (s) => Buffer.from(s, "base64").toString("binary"),
-    btoa: (s) => Buffer.from(s, "binary").toString("base64"),
-    setTimeout, clearTimeout, setInterval, clearInterval,
-    Promise, Error, Object, Array, String, Number, Boolean, Math, JSON, Date,
-    Map, Set, WeakMap, Symbol, Proxy, Reflect,
-    document: {
-      createElement: () => ({ style: {}, setAttribute() {}, appendChild() {}, remove() {} }),
-      head: { appendChild() {} }, body: { appendChild() {} },
-      querySelector: () => null, addEventListener() {}
-    },
-    navigator: { userAgent: "Node" },
-    location: { href: "https://coursatk.online/" },
-    HTMLElement: class {}, HTMLVideoElement: class {}, MediaSource: class {},
-    URL: { createObjectURL: () => "blob:x", revokeObjectURL() {} },
-    Blob: class { constructor(p) { this.p = p; } },
-    fetch: async () => ({ ok: false }),
-    XMLHttpRequest: class { open() {} send() {} setRequestHeader() {} }
-  };
-  sandbox.window = sandbox; sandbox.self = sandbox;
-  sandbox.globalThis = sandbox; sandbox.global = sandbox;
-  vm.runInNewContext(source, sandbox, { timeout: 8000 });
-  const du = sandbox.DecryptionUtils;
-  if (!du?.decryptPlaybackKey) throw new Error("DecryptionUtils missing");
-  decryptPlaybackKeyFn = du.decryptPlaybackKey.bind(du);
-  console.log("[crypto] ready");
+
+  const k = i.subarray(0, 16);  // 16 bytes salt
+  const s = i.subarray(16, 28); // 12 bytes iv
+  const f = i.subarray(28);     // 57 bytes ciphertext
+
+  if (r[0] !== (165 ^ k[0])) {
+    throw new Error("Invalid wrapped key header");
+  }
+
+  const vidBuf = Buffer.from(cleanVideoId, "utf8");
+  const revVidBuf = Buffer.from(cleanVideoId.split("").reverse().join(""), "utf8");
+
+  // Step 4: C = sha256(Od, vidBuf, Rd, k, xd)
+  const C = swSha256(SW_CONSTS.Od, vidBuf, SW_CONSTS.Rd, k, SW_CONSTS.xd);
+
+  // Step 5: a = hmac(C, revVidBuf, '|', k)
+  const hmac = crypto.createHmac("sha256", C);
+  hmac.update(revVidBuf);
+  hmac.update(Buffer.from("|", "utf8"));
+  hmac.update(k);
+  const a = hmac.digest();
+
+  // Step 6: m = pbkdf2(a, k, 1337, 32)
+  const m = crypto.pbkdf2Sync(a, k, 1337, 32, "sha256");
+
+  // Step 7: S = sha256(m, s, Pd) -> AES-256-GCM key
+  const S = swSha256(m, s, SW_CONSTS.Pd);
+
+  // Step 8 & 9: mask R
+  const h = swSha256(m, SW_CONSTS.qd);
+  const O = swSha256(m, SW_CONSTS.qd, Buffer.from([1]));
+  const R = Buffer.alloc(41);
+  h.copy(R, 0);
+  O.subarray(0, 9).copy(R, 32);
+
+  // Step 11: x = sha256(S, k, Qd)
+  const x = swSha256(S, k, SW_CONSTS.Qd);
+
+  // Step 12: unmask wire ciphertext P
+  const P = Buffer.alloc(57);
+  for (let W = 0; W < 57; W++) {
+    P[W] = f[W] ^ x[W % 32];
+  }
+
+  // Step 13: AES-256-GCM Decrypt
+  const ciphertext = P.subarray(0, 41);
+  const authTag = P.subarray(41);
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", S, s);
+  decipher.setAuthTag(authTag);
+  const Q = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+  if (Q.length !== 41) throw new Error("Invalid decrypted payload length");
+
+  // Step 14: Unmask Q with R
+  const G = Buffer.alloc(41);
+  for (let W = 0; W < 41; W++) {
+    G[W] = Q[W] ^ R[W];
+  }
+
+  // Step 15: Swap nibbles
+  const N = Buffer.alloc(41);
+  for (let W = 0; W < 41; W++) {
+    N[W] = ((G[W] << 4) | (G[W] >> 4)) & 0xFF;
+  }
+
+  // Step 16: Decode strings
+  const hexKey = N.subarray(0, 32).toString("utf8");
+  const code = N.subarray(32, 41).toString("utf8");
+
+  // Step 17: 16-byte AES-128 key
+  const key = Buffer.from(hexKey, "hex");
+  if (key.length !== 16) throw new Error("Invalid unwrap key length");
+
+  return { key, code };
 }
 
 async function unwrapKey(wrappedBuf, videoId) {
-  if (!decryptPlaybackKeyFn) throw new Error("crypto not loaded");
-  const wrapped = Buffer.isBuffer(wrappedBuf)
-    ? new Uint8Array(wrappedBuf)
-    : new Uint8Array(wrappedBuf);
-  if (wrapped.byteLength === 16) return Buffer.from(wrapped);
-  const result = await decryptPlaybackKeyFn(wrapped, String(videoId));
-  const key = result?.key;
-  if (!key) throw new Error("empty key");
-  const aes = Buffer.isBuffer(key)
-    ? key
-    : key instanceof ArrayBuffer
-      ? Buffer.from(key)
-      : Buffer.from(key.buffer || key, key.byteOffset || 0, key.byteLength || key.length);
-  if (aes.length !== 16) throw new Error(`key len ${aes.length}`);
-  return aes;
+  const result = decryptPlaybackKey(wrappedBuf, videoId);
+  return result.key;
 }
 
 function decryptSegment(encrypted, key, iv) {
@@ -1811,9 +1865,9 @@ setInterval(() => {
   }
 }, 60_000).unref();
 
-// Boot: hash bootstrap password properly + load crypto
+// Boot: hash bootstrap password properly + native crypto ready
 CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
-await loadDecryptionUtils();
+console.log("[crypto] native Stream-Weave decryption ready");
 
 // Seed default sections if missing
 try {
