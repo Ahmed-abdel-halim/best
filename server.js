@@ -98,7 +98,7 @@ const CONFIG = {
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN:
     process.env.COURSATK_TOKEN ||
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMTYyOTYsInJvbGUiOiJzdHVkZW50IiwidXVpZCI6ImM0YzVlMzU3YTkyMjFkNTJkNjk5NWFiNGRkODhjYjk2In0.FC2ySannXQAHsooVeSGAgxVfGX9dLhF2CS4TzZTfdMc",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxMjAwNzAsInJvbGUiOiJzdHVkZW50IiwidXVpZCI6ImM0YzVlMzU3YTkyMjFkNTJkNjk5NWFiNGRkODhjYjk2In0.YgAm28cDl6sLE9lDeQ0cZhZ_stdZQaYvvstlemaabMA",
   DEFAULT_YEAR_ID: 4,
   STREAM_HOSTS: [
     "api.coursatk.online",
@@ -114,8 +114,8 @@ const CONFIG = {
   STREAM_REFERER: "https://coursatk.online/",
   STREAM_X_REQUESTED_WITH: "com.mycompany.app.soulbrowser",
   STREAM_UA:
-    "Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/155.0.8059.43 Mobile Safari/537.36",
-  STREAM_SEC_CH_UA: '"Android WebView";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
+    "Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/156.0.8078.47 Mobile Safari/537.36",
+  STREAM_SEC_CH_UA: '"Not:A-Brand";v="8", "Chromium";v="156", "Android WebView";v="156"',
   STREAM_SEC_CH_UA_PLATFORM: '"Android"',
   STREAM_ACCEPT_LANGUAGE: "ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6",
   STREAM_WEAVE_API: "https://api.stream-weave.com",
@@ -435,7 +435,99 @@ function swSha256(...buffers) {
   return hash.digest();
 }
 
-function decryptPlaybackKey(wrappedBuf, videoId) {
+function computeSwProof(keySeed, ticket) {
+  if (!keySeed) throw new Error("keySeed مطلوب لحساب proof");
+  const seedBuf = Buffer.isBuffer(keySeed)
+    ? keySeed
+    : (typeof keySeed === "string" ? Buffer.from(keySeed.replace(/-/g, "+").replace(/_/g, "/"), "base64") : Buffer.from(keySeed));
+  const hmac = crypto.createHmac("sha256", seedBuf);
+  hmac.update(Buffer.from("vh-key-ticket-v1|" + ticket, "utf8"));
+  return hmac.digest().toString("base64url");
+}
+
+function extractSidFromJwt(token) {
+  if (!token || typeof token !== "string") return null;
+  try {
+    const parts = token.split(".");
+    if (parts.length >= 2) {
+      const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+      return payload.sid || null;
+    }
+  } catch {}
+  return null;
+}
+
+function decryptPlaybackKeyV3Parsed(k, s, f, cleanVideoId, sessionId, keySeed) {
+  const cleanSessionId = String(sessionId || "").trim().toLowerCase();
+  if (!cleanSessionId) throw new Error("Missing sessionId for V3 key unwrap");
+  if (!keySeed) throw new Error("Missing keySeed for V3 key unwrap");
+
+  const seedBuf = Buffer.isBuffer(keySeed)
+    ? keySeed
+    : (typeof keySeed === "string" ? Buffer.from(keySeed.replace(/-/g, "+").replace(/_/g, "/"), "base64") : Buffer.from(keySeed));
+  if (seedBuf.length !== 32) throw new Error("Invalid keySeed length: " + seedBuf.length);
+
+  // 1. kek = hmac_sha256(seedBuf, "vh-kek-v3|" + videoId + "|" + sessionId + "|" + salt)
+  const hmac = crypto.createHmac("sha256", seedBuf);
+  hmac.update(Buffer.from("vh-kek-v3|" + cleanVideoId + "|" + cleanSessionId + "|", "utf8"));
+  hmac.update(k);
+  const kek = hmac.digest();
+
+  // 2. m = pbkdf2(kek, salt, 1337, 32, "sha256")
+  const m = crypto.pbkdf2Sync(kek, k, 1337, 32, "sha256");
+
+  // 3. S = sha256(m, iv, "vh-aes") -> AES-256-GCM key
+  const S = swSha256(m, s, Buffer.from("vh-aes", "utf8"));
+
+  // 4. mask R (41 bytes)
+  const h = swSha256(m, Buffer.from("vh-xor", "utf8"));
+  const O = swSha256(m, Buffer.from("vh-xor", "utf8"), Buffer.from([1]));
+  const R = Buffer.alloc(41);
+  h.copy(R, 0);
+  O.subarray(0, 9).copy(R, 32);
+
+  // 5. wire mask x = sha256(S, salt, "vh-wire")
+  const x = swSha256(S, k, Buffer.from("vh-wire", "utf8"));
+
+  // 6. unmask wire ciphertext P
+  const P = Buffer.alloc(57);
+  for (let W = 0; W < 57; W++) {
+    P[W] = f[W] ^ x[W % 32];
+  }
+
+  // 7. AES-256-GCM Decrypt
+  const ciphertext = P.subarray(0, 41);
+  const authTag = P.subarray(41);
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", S, s);
+  decipher.setAuthTag(authTag);
+  const Q = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  if (Q.length !== 41) throw new Error("Invalid decrypted payload length");
+
+  // 8. Unmask Q with R
+  const G = Buffer.alloc(41);
+  for (let W = 0; W < 41; W++) {
+    G[W] = Q[W] ^ R[W];
+  }
+
+  // 9. Swap nibbles
+  const N = Buffer.alloc(41);
+  for (let W = 0; W < 41; W++) {
+    N[W] = ((G[W] << 4) | (G[W] >> 4)) & 0xff;
+  }
+
+  // 10. Decode strings
+  const hexKey = N.subarray(0, 32).toString("utf8");
+  const code = N.subarray(32, 41).toString("utf8");
+
+  // 11. 16-byte AES-128 key
+  const key = Buffer.from(hexKey, "hex");
+  if (key.length !== 16) throw new Error("Invalid unwrap key length");
+
+  return { key, code };
+}
+
+function decryptPlaybackKey(wrappedBuf, videoId, sessionId = null, keySeed = null) {
   const r = Buffer.isBuffer(wrappedBuf) ? wrappedBuf : Buffer.from(wrappedBuf);
   if (r.length === 16) return { key: r, code: "" };
   if (r.length !== 86) throw new Error("Invalid wrapped key length: " + r.length);
@@ -453,6 +545,12 @@ function decryptPlaybackKey(wrappedBuf, videoId) {
   const s = i.subarray(16, 28); // 12 bytes iv
   const f = i.subarray(28);     // 57 bytes ciphertext
 
+  // V3 header: 90 ^ k[0]
+  if (r[0] === (90 ^ k[0])) {
+    return decryptPlaybackKeyV3Parsed(k, s, f, cleanVideoId, sessionId, keySeed);
+  }
+
+  // V2 header: 165 ^ k[0]
   if (r[0] !== (165 ^ k[0])) {
     throw new Error("Invalid wrapped key header");
   }
@@ -525,9 +623,76 @@ function decryptPlaybackKey(wrappedBuf, videoId) {
   return { key, code };
 }
 
-async function unwrapKey(wrappedBuf, videoId) {
-  const result = decryptPlaybackKey(wrappedBuf, videoId);
+async function unwrapKey(wrappedBuf, videoId, sessionId = null, keySeed = null) {
+  const result = decryptPlaybackKey(wrappedBuf, videoId, sessionId, keySeed);
   return result.key;
+}
+
+async function fetchStreamWeaveKey(session, keyUrl = null) {
+  if (session.plainKey) return session.plainKey;
+
+  const sid = session.playbackSessionId || session.sid || extractSidFromJwt(session.token);
+  const keySeed = session.keySeed;
+
+  // Try V3 key-ticket + proof if session ID and keySeed are available
+  if (sid && keySeed) {
+    try {
+      const ticketUrl = `${CONFIG.STREAM_WEAVE_API}/api/v1/playback/session/${encodeURIComponent(sid)}/key-ticket`;
+      try { session.allowedHosts.add(new URL(ticketUrl).hostname); } catch {}
+      const ticketRes = await streamFetch(session, ticketUrl, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Length": "0",
+          Pragma: "no-cache",
+          "Cache-Control": "no-cache"
+        }
+      });
+      if (ticketRes.ok) {
+        const ticketData = await ticketRes.json().catch(() => null);
+        const ticket = ticketData?.ticket;
+        if (ticket) {
+          const proof = computeSwProof(keySeed, ticket);
+          const actualKeyUrl = `${CONFIG.STREAM_WEAVE_API}/api/v1/playback/session/${encodeURIComponent(sid)}/key`;
+          try { session.allowedHosts.add(new URL(actualKeyUrl).hostname); } catch {}
+          const keyRes = await streamFetch(session, actualKeyUrl, {
+            headers: {
+              Accept: "*/*",
+              Pragma: "no-cache",
+              "Cache-Control": "no-cache",
+              "X-SW-Ticket": ticket,
+              "X-SW-Proof": proof
+            }
+          });
+          if (keyRes.ok) {
+            const wrapped = Buffer.from(await keyRes.arrayBuffer());
+            session.plainKey = await unwrapKey(wrapped, session.videoId, sid, keySeed);
+            console.log(`[key-v3] unwrapped for ${session.videoId} (sid: ${sid})`);
+            return session.plainKey;
+          } else {
+            console.warn(`[key-v3] key fetch failed HTTP ${keyRes.status}`);
+          }
+        }
+      } else {
+        console.warn(`[key-v3] key-ticket failed HTTP ${ticketRes.status}`);
+      }
+    } catch (e) {
+      console.warn("[key-v3-ticket-error]", e.message);
+    }
+  }
+
+  // Fallback to direct key fetch (V2 or standard keyUrl)
+  if (keyUrl) {
+    try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
+    const keyRes = await streamFetch(session, keyUrl);
+    if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
+    const wrapped = Buffer.from(await keyRes.arrayBuffer());
+    session.plainKey = await unwrapKey(wrapped, session.videoId, sid, keySeed);
+    console.log(`[key] unwrapped for ${session.videoId}`);
+    return session.plainKey;
+  }
+
+  throw new Error("تعذّر جلب مفتاح الفيديو");
 }
 
 function decryptSegment(encrypted, key, iv) {
@@ -630,8 +795,16 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
       "sec-ch-ua-platform": CONFIG.STREAM_SEC_CH_UA_PLATFORM,
       "sec-ch-ua": CONFIG.STREAM_SEC_CH_UA,
       "sec-ch-ua-mobile": "?1",
-      "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE
+      "sec-fetch-site": "cross-site",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-dest": "empty",
+      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE,
+      Priority: "u=1, i"
     };
+    if (url.includes("stream-weave.com")) {
+      headers["x-sw-key-version"] = "3";
+    }
     if (session?.token) headers.Authorization = `Bearer ${session.token}`;
   }
   for (const [k, v] of Object.entries(extra || {})) {
@@ -654,6 +827,23 @@ async function proxyStreamPath(relPath, session, req, res) {
     const norm = clean.replace(/^\/+/, "");
     const pth = norm.startsWith("api/") ? norm : `api/v1/${norm}`;
     upstreamUrl = `${base}/${pth}`;
+  }
+
+  // Intercept key request: unwrap and return plain 16-byte key directly
+  if (/\/key(\?|$)/i.test(clean)) {
+    try {
+      const plainKey = await fetchStreamWeaveKey(session, upstreamUrl);
+      if (plainKey && plainKey.length === 16) {
+        res.set({
+          "Content-Type": "application/octet-stream",
+          "Cache-Control": "no-store",
+          "Access-Control-Allow-Origin": "*"
+        });
+        return res.send(plainKey);
+      }
+    } catch (e) {
+      console.warn("[proxyStreamPath-key-err]", e.message);
+    }
   }
 
   const fakeSession = {
@@ -1087,6 +1277,8 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       id,
       videoId: String(data.data.video_id),
       token: data.data.token,
+      keySeed: data.data.key_seed || null,
+      playbackSessionId: data.data.session_id || null,
       streamUrl: data.data.stream_url,
       playId: String(req.params.videoId),
       createdAt: now(),
@@ -1132,6 +1324,8 @@ async function refreshPlayback(session) {
   }
   session.token = data.data.token;
   session.streamUrl = data.data.stream_url;
+  session.keySeed = data.data.key_seed || session.keySeed;
+  session.playbackSessionId = data.data.session_id || session.playbackSessionId;
   try { session.allowedHosts.add(new URL(session.streamUrl).hostname); } catch {}
   session.lastUsed = now();
   console.log(`[refresh] playback token renewed for ${session.videoId}`);
@@ -1156,6 +1350,8 @@ app.post("/api/video/:videoId/play", requireStudent, async (req, res) => {
       id,
       videoId: String(data.data.video_id),
       token: data.data.token,          // NEVER sent to client
+      keySeed: data.data.key_seed || null,
+      playbackSessionId: data.data.session_id || null,
       streamUrl: data.data.stream_url || null,
       playId: String(req.params.videoId),
       createdAt: now(),
@@ -1275,11 +1471,7 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
         keyFetched = true;
       } else if (uri && !keyFetched) {
         const keyUrl = new URL(uri, baseUrl).href;
-        try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
-        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
-        const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        session.plainKey = await unwrapKey(wrapped, session.videoId);
+        session.plainKey = await fetchStreamWeaveKey(session, keyUrl);
         session.defaultIv = currentIv;
         keyFetched = true;
         console.log(`[key] unwrapped for ${session.videoId}`);
