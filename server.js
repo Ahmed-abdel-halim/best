@@ -645,7 +645,6 @@ async function fetchStreamWeaveKey(session, keyUrl = null) {
         method: "POST",
         headers: {
           Accept: "application/json",
-          "Content-Length": "0",
           Pragma: "no-cache",
           "Cache-Control": "no-cache"
         }
@@ -658,18 +657,20 @@ async function fetchStreamWeaveKey(session, keyUrl = null) {
           const actualKeyUrl = `${CONFIG.STREAM_WEAVE_API}/api/v1/playback/session/${encodeURIComponent(sid)}/key`;
           try { session.allowedHosts.add(new URL(actualKeyUrl).hostname); } catch {}
           const keyRes = await streamFetch(session, actualKeyUrl, {
+            method: "GET",
             headers: {
               Accept: "*/*",
               Pragma: "no-cache",
               "Cache-Control": "no-cache",
               "X-SW-Ticket": ticket,
-              "X-SW-Proof": proof
+              "X-SW-Proof": proof,
+              "x-sw-key-version": "3"
             }
           });
           if (keyRes.ok) {
             const wrapped = Buffer.from(await keyRes.arrayBuffer());
             session.plainKey = await unwrapKey(wrapped, session.videoId, sid, keySeed);
-            console.log(`[key-v3] unwrapped for ${session.videoId} (sid: ${sid})`);
+            console.log(`[key-v3] unwrapped for ${session.videoId} (sid: ${sid}) -> hex: ${session.plainKey.toString("hex")}`);
             return session.plainKey;
           } else {
             console.warn(`[key-v3] key fetch failed HTTP ${keyRes.status}`);
@@ -809,10 +810,33 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     }
     if (session?.token) headers.Authorization = `Bearer ${session.token}`;
   }
-  for (const [k, v] of Object.entries(extra || {})) {
-    if (v != null && v !== "") headers[k] = v;
+  let method = "GET";
+  let body = undefined;
+
+  if (extra && typeof extra === "object") {
+    if (extra.method) method = extra.method;
+    if (extra.body) body = extra.body;
+    if (extra.headers && typeof extra.headers === "object") {
+      for (const [k, v] of Object.entries(extra.headers)) {
+        if (v != null && v !== "") headers[k] = v;
+      }
+    }
+    for (const [k, v] of Object.entries(extra)) {
+      if (k !== "method" && k !== "headers" && k !== "body" && v != null && v !== "") {
+        headers[k] = v;
+      }
+    }
   }
-  return fetch(url, { headers, cache: "no-store", redirect: "follow" });
+
+  const fetchOpts = {
+    method,
+    headers,
+    cache: "no-store",
+    redirect: "follow"
+  };
+  if (body) fetchOpts.body = body;
+
+  return fetch(url, fetchOpts);
 }
 
 /** Proxy Stream-Weave path. Stream JWT stays SERVER-SIDE only (session.token). */
@@ -1367,11 +1391,16 @@ app.post("/api/video/:videoId/play", requireStudent, async (req, res) => {
       success: true,
       data: {
         session: id,
-        video_id: data.data.video_id
-        // no token, no stream_url — hidden on purpose
+        video_id: data.data.video_id,
+        key_seed: data.data.key_seed || null,
+        session_id: data.data.session_id || null,
+        key_version: data.data.key_version || 3
       },
       session: id,
-      video_id: data.data.video_id
+      video_id: data.data.video_id,
+      key_seed: data.data.key_seed || null,
+      session_id: data.data.session_id || null,
+      key_version: data.data.key_version || 3
     });
   } catch (e) {
     jsonError(res, 502, e.message);
