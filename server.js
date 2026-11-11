@@ -119,7 +119,7 @@ const CONFIG = {
   STREAM_SEC_CH_UA_PLATFORM: '"Android"',
   STREAM_ACCEPT_LANGUAGE: "ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6",
   STREAM_WEAVE_API: "https://api.stream-weave.com",
-  PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
+  PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=3.0.1",
   // Firebase RTDB (open rules as provided)
   FIREBASE: "https://english-73376-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
@@ -628,6 +628,8 @@ async function unwrapKey(wrappedBuf, videoId, sessionId = null, keySeed = null) 
   return result.key;
 }
 
+const decryptPlaybackKeyFn = decryptPlaybackKey;
+
 async function fetchStreamWeaveKey(session, keyUrl = null) {
   if (session.plainKey) return session.plainKey;
 
@@ -780,7 +782,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
       "sec-fetch-mode": "cors",
       "sec-fetch-dest": "empty",
       Referer: CONFIG.STREAM_REFERER,
-      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Accept-Encoding": "gzip, deflate",
       "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE,
       Priority: "u=1, i"
     };
@@ -791,14 +793,14 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
       Origin: CONFIG.STREAM_ORIGIN,
       Referer: CONFIG.STREAM_REFERER,
       "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
-      "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA,
+      "User-Agent": CONFIG.STREAM_UA,
       "sec-ch-ua-platform": CONFIG.STREAM_SEC_CH_UA_PLATFORM,
       "sec-ch-ua": CONFIG.STREAM_SEC_CH_UA,
       "sec-ch-ua-mobile": "?1",
       "sec-fetch-site": "cross-site",
       "sec-fetch-mode": "cors",
       "sec-fetch-dest": "empty",
-      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Accept-Encoding": "gzip, deflate",
       "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE,
       Priority: "u=1, i"
     };
@@ -830,7 +832,7 @@ async function proxyStreamPath(relPath, session, req, res) {
   }
 
   // Intercept key request: unwrap and return plain 16-byte key directly
-  if (/\/key(\?|$)/i.test(clean)) {
+  if (/\/key(?:\.bin)?(\?|$)/i.test(clean) || clean.includes("/key")) {
     try {
       const plainKey = await fetchStreamWeaveKey(session, upstreamUrl);
       if (plainKey && plainKey.length === 16) {
@@ -931,7 +933,7 @@ app.get("/api/public/debug-upstream", async (req, res) => {
       "sec-fetch-mode": "cors",
       "sec-fetch-dest": "empty",
       Referer: CONFIG.STREAM_REFERER,
-      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Accept-Encoding": "gzip, deflate",
       "Accept-Language": CONFIG.STREAM_ACCEPT_LANGUAGE,
       Priority: "u=1, i"
     } : {};
